@@ -14,6 +14,17 @@ export default defineConfig({
   build: {
     outDir: '../dist',
     emptyOutDir: true,
-    chunkSizeWarningLimit: 1200
+    chunkSizeWarningLimit: 1200,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return;
+          if (id.includes('react-router-dom')) return 'router-vendor';
+          if (id.includes('recharts')) return 'charts-vendor';
+          if (id.includes('lucide-react')) return 'icons-vendor';
+          if (id.includes('react')) return 'react-vendor';
+        }
+      }
+    }
   }
 });

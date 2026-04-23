@@ -34,7 +34,7 @@ import {
   Users,
   Utensils
 } from 'lucide-react';
-import { createContext, useCallback, useContext, useDeferredValue, useEffect, useMemo, useState } from 'react';
+import { createContext, useCallback, useContext, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
   Area,
@@ -48,7 +48,7 @@ import {
   XAxis,
   YAxis
 } from 'recharts';
-import { api, dateText, getBlockNotice, money, setBlockNotice, setToken } from './api.js';
+import { api, dateText, getBlockNotice, money, peekApiCache, setBlockNotice, setToken } from './api.js';
 
 const AuthContext = createContext(null);
 
@@ -259,34 +259,101 @@ function useAuth() {
 }
 
 function useLoad(path, initialValue, options = {}) {
-  const { refreshMs = 0 } = options;
-  const [data, setData] = useState(initialValue);
-  const [loading, setLoading] = useState(true);
+  const {
+    refreshMs = 0,
+    cacheTtlMs = 8000,
+    pauseWhenHidden = true,
+    revalidateOnFocus = true,
+    revalidateOnReconnect = true
+  } = options;
+  const latestInitialValueRef = useRef(initialValue);
+  latestInitialValueRef.current = initialValue;
+  const initialCache = useMemo(() => peekApiCache(path), [path]);
+  const [data, setData] = useState(() => initialCache?.data ?? initialValue);
+  const [loading, setLoading] = useState(() => !initialCache?.data);
   const [error, setError] = useState('');
+  const inFlightRef = useRef(null);
+  const lastLoadedRef = useRef(initialCache?.updatedAt || 0);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (loadOptions = {}) => {
+    const { background = false, forceFresh = false, reason = 'manual' } = loadOptions;
+    const pageHidden = typeof document !== 'undefined' && document.hidden;
+    if (pauseWhenHidden && pageHidden && reason === 'interval') return inFlightRef.current;
+    if (inFlightRef.current) return inFlightRef.current;
+    if (!background) setLoading(true);
     setError('');
+    const request = api(path, { cacheTtlMs, forceFresh });
+    inFlightRef.current = request;
     try {
-      setData(await api(path));
+      const nextData = await request;
+      setData(nextData);
+      lastLoadedRef.current = Date.now();
+      return nextData;
     } catch (err) {
       setError(err.message);
+      throw err;
     } finally {
-      setLoading(false);
+      if (inFlightRef.current === request) inFlightRef.current = null;
+      if (!background) setLoading(false);
     }
-  }, [path]);
+  }, [cacheTtlMs, path, pauseWhenHidden]);
 
   useEffect(() => {
-    load();
+    const cached = peekApiCache(path);
+    if (cached?.data) {
+      setData(cached.data);
+      setLoading(false);
+      lastLoadedRef.current = cached.updatedAt || Date.now();
+      if (!cached.fresh) {
+        load({ background: true, forceFresh: true, reason: 'stale-mount' }).catch(() => {});
+      }
+      return;
+    }
+
+    setData(latestInitialValueRef.current);
+    setLoading(true);
+    load({ reason: 'mount' }).catch(() => {});
   }, [load]);
 
   useEffect(() => {
     if (!refreshMs) return undefined;
     const intervalId = window.setInterval(() => {
-      load();
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      load({ background: true, forceFresh: true, reason: 'interval' }).catch(() => {});
     }, refreshMs);
     return () => window.clearInterval(intervalId);
   }, [load, refreshMs]);
+
+  useEffect(() => {
+    if (!revalidateOnFocus && !revalidateOnReconnect) return undefined;
+
+    const revalidate = () => {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      if (Date.now() - lastLoadedRef.current < 5000) return;
+      load({ background: true, forceFresh: true, reason: 'revalidate' }).catch(() => {});
+    };
+
+    const handleVisibility = () => {
+      if (revalidateOnFocus && typeof document !== 'undefined' && !document.hidden) {
+        revalidate();
+      }
+    };
+    const handleFocus = () => {
+      if (revalidateOnFocus) revalidate();
+    };
+    const handleOnline = () => {
+      if (revalidateOnReconnect) revalidate();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('online', handleOnline);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [load, revalidateOnFocus, revalidateOnReconnect]);
 
   return { data, setData, loading, error, load };
 }
@@ -489,20 +556,13 @@ function AdminTopbarTools({ user }) {
     notifications: [],
     searchIndex: [],
     live: { pendingBookings: 0, dirtyRooms: 0, readyOrders: 0, arrivalsToday: 0, departuresToday: 0 }
-  });
+  }, { refreshMs: 30000, cacheTtlMs: 5000 });
   const [query, setQuery] = useState('');
   const deferredQuery = useDeferredValue(query.trim().toLowerCase());
   const [searchOpen, setSearchOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [seenNotifications, setSeenNotifications] = useState([]);
-
-  useEffect(() => {
-    const intervalId = window.setInterval(() => {
-      load();
-    }, 30000);
-    return () => window.clearInterval(intervalId);
-  }, [load]);
 
   useEffect(() => {
     setSearchOpen(Boolean(query.trim()));
@@ -4290,7 +4350,7 @@ function GuestDashboard() {
           <article className="guest-stat-card accent-violet">
             <span>Membership Tier</span>
             <strong>{data.stats.membershipTier}</strong>
-            <small>Your loyalty tier updates as you continue staying with us.</small>
+            <small>Your loyalty tier now steps up every 6000 points.</small>
           </article>
           <article className="guest-stat-card accent-emerald">
             <span>Loyalty Points</span>
@@ -4547,15 +4607,19 @@ function GuestBookRoom() {
 
 function GuestOrderFood() {
   const { data, error } = useLoad('/public/menu', { menu: fallbackMenu }, { refreshMs: 15000 });
-  const { data: dashboard } = useLoad('/guests/dashboard', { stats: { currentBill: 0, membershipTier: 'Silver', loyaltyPoints: 0 }, bookings: [], active: null, user: null }, { refreshMs: 15000 });
+  const { data: dashboard } = useLoad('/guests/dashboard', { stats: { currentBill: 0, membershipTier: 'Silver', loyaltyPoints: 0 }, bookings: [], active: null, checkedInBooking: null, user: null }, { refreshMs: 15000 });
   const [cart, setCart] = useState({});
   const [notes, setNotes] = useState('');
   const [notice, setNotice] = useState('');
   const [actionError, setActionError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const menuItems = Array.isArray(data.menu) ? data.menu : fallbackMenu;
+  const checkedInBooking = dashboard.checkedInBooking || dashboard.bookings.find((booking) => booking.status === 'checked-in') || null;
+  const pendingCheckInBooking = dashboard.bookings.find((booking) => booking.status === 'confirmed') || null;
+  const canOrderFood = Boolean(checkedInBooking);
 
   const updateCart = (item, delta) => {
+    if (!canOrderFood) return;
     setCart((current) => {
       const next = { ...current };
       const value = Math.max(0, (next[item.id] || 0) + delta);
@@ -4572,6 +4636,14 @@ function GuestOrderFood() {
   const submit = async () => {
     setNotice('');
     setActionError('');
+    if (!canOrderFood) {
+      setActionError(
+        pendingCheckInBooking
+          ? 'Food ordering opens after front desk confirms your check-in.'
+          : 'You need a checked-in stay before ordering room service.'
+      );
+      return;
+    }
     if (!items.length) {
       setActionError('Add at least one menu item before placing an order.');
       return;
@@ -4601,9 +4673,9 @@ function GuestOrderFood() {
             <small>Items currently available for room-service ordering.</small>
           </article>
           <article className="guest-stat-card accent-violet">
-            <span>Active Stay</span>
-            <strong>{dashboard.active ? `Room ${dashboard.active.room?.number || '-'}` : 'No stay'}</strong>
-            <small>{dashboard.active ? 'Orders will route to your current room automatically.' : 'A confirmed stay is needed before ordering room service.'}</small>
+            <span>Check-In Status</span>
+            <strong>{checkedInBooking ? `Room ${checkedInBooking.room?.number || '-'}` : pendingCheckInBooking ? 'Awaiting Front Desk' : 'No stay'}</strong>
+            <small>{checkedInBooking ? 'Orders will route to your checked-in room automatically.' : pendingCheckInBooking ? 'Front desk confirmation is still pending before food ordering unlocks.' : 'Book and check in to unlock room service.'}</small>
           </article>
           <article className="guest-stat-card accent-emerald">
             <span>Tray Total</span>
@@ -4612,6 +4684,13 @@ function GuestOrderFood() {
           </article>
         </div>
       </section>
+      {!canOrderFood && (
+        <div className="notice warning">
+          {pendingCheckInBooking
+            ? `Your booking for Room ${pendingCheckInBooking.room?.number || '-'} is confirmed, but room service will unlock only after front desk completes check-in.`
+            : 'Room service is available only for checked-in guests. Please complete booking and front desk check-in first.'}
+        </div>
+      )}
       {notice && <div className="notice success">{notice}</div>}
       {actionError && <div className="notice danger">{actionError}</div>}
       {error && <div className="notice warning">{error}</div>}
@@ -4631,11 +4710,13 @@ function GuestOrderFood() {
                 <p>{item.description || `Freshly prepared ${item.category.toLowerCase()} for room delivery.`}</p>
                 <div className="guest-menu-actions">
                   <div className="guest-qty-control">
-                    <button type="button" onClick={() => updateCart(item, -1)} aria-label={`Remove ${item.name}`}><span>-</span></button>
+                    <button type="button" disabled={!canOrderFood} onClick={() => updateCart(item, -1)} aria-label={`Remove ${item.name}`}><span>-</span></button>
                     <strong>{cart[item.id] || 0}</strong>
-                    <button type="button" onClick={() => updateCart(item, 1)} aria-label={`Add ${item.name}`}><span>+</span></button>
+                    <button type="button" disabled={!canOrderFood} onClick={() => updateCart(item, 1)} aria-label={`Add ${item.name}`}><span>+</span></button>
                   </div>
-                  <button className="primary-button guest-header-button" type="button" onClick={() => updateCart(item, 1)}>Add to Tray</button>
+                  <button className="primary-button guest-header-button" type="button" disabled={!canOrderFood} onClick={() => updateCart(item, 1)}>
+                    {canOrderFood ? 'Add to Tray' : 'Check-In Required'}
+                  </button>
                 </div>
               </div>
             </article>
@@ -4666,8 +4747,8 @@ function GuestOrderFood() {
             <span>Total</span>
             <strong>{money(cartTotal)}</strong>
           </div>
-          <button className="primary-button wide guest-header-button" disabled={!cartRows.length || submitting} onClick={submit}>
-            {submitting ? 'Sending Order...' : 'Place Room-Service Order'}
+          <button className="primary-button wide guest-header-button" disabled={!canOrderFood || !cartRows.length || submitting} onClick={submit}>
+            {submitting ? 'Sending Order...' : canOrderFood ? 'Place Room-Service Order' : 'Front Desk Check-In Pending'}
           </button>
         </aside>
       </div>

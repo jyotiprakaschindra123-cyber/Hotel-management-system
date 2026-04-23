@@ -100,6 +100,34 @@ const signToken = (user) => jwt.sign({ id: user.id || user._id, role: user.role 
 
 const publicUserFields = 'username email firstName lastName phone address avatar role jobTitle salary experience membershipTier loyaltyPoints createdAt';
 const managedPanelRoles = ['frontdesk', 'guest', 'kitchen', 'housekeeping'];
+const membershipTierSteps = ['Silver', 'Gold', 'Platinum', 'Diamond'];
+
+function membershipTierForPoints(points = 0) {
+  const normalizedPoints = Math.max(0, Number(points) || 0);
+  const tierIndex = Math.min(membershipTierSteps.length - 1, Math.floor(normalizedPoints / 6000));
+  return membershipTierSteps[tierIndex];
+}
+
+async function syncMembershipTier(user) {
+  if (!user) return user;
+  const nextTier = membershipTierForPoints(user.loyaltyPoints);
+  if (user.membershipTier !== nextTier) {
+    user.membershipTier = nextTier;
+    await user.save();
+  }
+  return user;
+}
+
+async function addLoyaltyPoints(userId, pointsToAdd) {
+  const increment = Math.max(0, Math.round(Number(pointsToAdd) || 0));
+  if (!increment) return null;
+  const user = await User.findById(userId);
+  if (!user) return null;
+  user.loyaltyPoints = Math.max(0, Number(user.loyaltyPoints || 0) + increment);
+  user.membershipTier = membershipTierForPoints(user.loyaltyPoints);
+  await user.save();
+  return user;
+}
 
 function defaultPanelLocks() {
   return {
@@ -177,6 +205,7 @@ const authorize = (roles = [], options = {}) =>
       const decoded = jwt.verify(token, jwtSecret);
       const user = await User.findById(decoded.id).select(publicUserFields);
       if (!user) return res.status(401).json({ message: 'Session expired.' });
+      if (user.role === 'guest') await syncMembershipTier(user);
       if (roles.length && !roles.includes(user.role)) {
         return res.status(403).json({ message: 'You do not have access to this area.' });
       }
@@ -498,7 +527,7 @@ async function finalizeCheckout(bookingId, payment = {}) {
   if (firstCompletion) {
     invoice.booking.room.status = 'dirty';
     await invoice.booking.room.save();
-    await User.findByIdAndUpdate(invoice.booking.guest._id, { $inc: { loyaltyPoints: Math.round(invoice.grandTotal) } });
+    await addLoyaltyPoints(invoice.booking.guest._id, invoice.grandTotal);
   }
 
   await invoice.booking.save();
@@ -605,7 +634,7 @@ app.post(
       lastName,
       phone,
       address,
-      membershipTier: 'Silver',
+      membershipTier: membershipTierForPoints(0),
       loyaltyPoints: 0
     });
     res.status(201).json({ token: signToken(user), user: user.toJSON() });
@@ -1078,7 +1107,7 @@ app.post(
       roomTotal: nights * room.price,
       grandTotal: nights * room.price
     });
-    await User.findByIdAndUpdate(req.user._id, { $inc: { loyaltyPoints: Math.round(room.price) } });
+    await addLoyaltyPoints(req.user._id, room.price);
     res.status(201).json({ booking: await populateBooking(Booking.findById(booking._id)) });
   })
 );
@@ -1101,7 +1130,7 @@ app.post(
         lastName: req.body.lastName,
         phone: req.body.phone,
         address: req.body.address,
-        membershipTier: 'Silver'
+        membershipTier: membershipTierForPoints(0)
       });
     }
     const nights = nightsBetween(req.body.checkIn, req.body.checkOut);
@@ -1269,16 +1298,18 @@ app.get(
     const bookings = await populateBooking(Booking.find({ guest: req.user._id }));
     const orders = await Order.find({ guest: req.user._id });
     const active = bookings.find((booking) => ['confirmed', 'checked-in'].includes(booking.status));
+    const checkedInBooking = bookings.find((booking) => booking.status === 'checked-in') || null;
     const currentBill = active ? active.grandTotal + orders.filter((order) => String(order.booking) === String(active._id)).reduce((total, order) => total + order.total, 0) : 0;
     res.json({
       user: req.user,
       stats: {
         currentBill,
-        membershipTier: req.user.membershipTier,
+        membershipTier: membershipTierForPoints(req.user.loyaltyPoints),
         loyaltyPoints: req.user.loyaltyPoints
       },
       bookings,
-      active
+      active,
+      checkedInBooking
     });
   })
 );
@@ -1299,8 +1330,14 @@ app.post(
   '/api/orders',
   requireAuth('guest'),
   asyncHandler(async (req, res) => {
-    const booking = await Booking.findOne({ guest: req.user._id, status: { $in: ['confirmed', 'checked-in'] } }).sort({ createdAt: -1 });
-    if (!booking) return res.status(409).json({ message: 'You need an active booking before ordering room service.' });
+    const booking = await Booking.findOne({ guest: req.user._id, status: 'checked-in' }).sort({ createdAt: -1 });
+    if (!booking) {
+      const pendingBooking = await Booking.findOne({ guest: req.user._id, status: 'confirmed' }).sort({ createdAt: -1 });
+      if (pendingBooking) {
+        return res.status(409).json({ message: 'Room service unlocks after the front desk completes your check-in confirmation.' });
+      }
+      return res.status(409).json({ message: 'You need a checked-in stay before ordering room service.' });
+    }
     const requestedItems = Array.isArray(req.body.items) ? req.body.items : [];
     const menuIds = requestedItems.map((item) => item.menuItem);
     const menu = await MenuItem.find({ _id: { $in: menuIds }, available: true });
