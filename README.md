@@ -161,7 +161,7 @@ These are seeded demo accounts for local/testing use:
 
 | Role | Username | Password |
 |---|---|---|
-| Admin | `admin` | `admin123` |
+| Admin | `hmsadmin` | `hms123` |
 | Front Desk | `frontdesk` | `front123` |
 | Guest | `sumit` | `guest123` |
 | Kitchen | `kitchen` | `kitchen123` |
